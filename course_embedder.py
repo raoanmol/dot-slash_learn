@@ -38,8 +38,16 @@ class CourseEmbedder:
         self.exclude_extensions = exclude_extensions or []
         self.exclude_filenames = exclude_filenames or []
 
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'Using device: {self.device}')
+        if self.device.type == 'cuda':
+            print(f'GPU: {torch.cuda.get_device_name(0)}')
+            print(f'Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB')
+
         self.tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen3-Embedding-4B')
         self.model = AutoModel.from_pretrained('Qwen/Qwen3-Embedding-4B')
+        self.model.to(self.device)
+        self.model.eval()
 
         self.client = QdrantClient(host = qdrant_host, port = qdrant_port)
         self.collection_name = collection_name
@@ -91,6 +99,8 @@ class CourseEmbedder:
             return [0.0] * 2560
 
         inputs = self.tokenizer(text, return_tensors = 'pt', truncation = True, max_length = 8192, padding = True)
+
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = self.model(**inputs)
