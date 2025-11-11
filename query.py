@@ -9,9 +9,13 @@ Advanced RAG implementation with sibling file expansion:
 5. STAGE 2: Expands top 3 with their sibling files (from Qdrant or disk)
 6. Final rerank of expanded set to get final top 3 documents
 
+This module is designed to be imported by llm.py, not run standalone.
+
 Usage:
-    python query.py "What is dynamic programming?"
-    python query.py "Explain Newton's laws" --collection physics_materials
+    from query import QueryEngine
+
+    engine = QueryEngine(collection_name='cs_materials')
+    results = engine.search(query, top_k=3, use_reranker=True)
 '''
 
 import argparse
@@ -72,20 +76,26 @@ class QueryEngine:
 
         return embedding.cpu().numpy().tolist()
 
-    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 10):
-        """Search for relevant documents and print results with two-stage reranking"""
-        print(f'Query: "{query}"\n')
-        print('='*80)
+    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 10, verbose: bool = True):
+        """
+        Search for relevant documents with two-stage reranking.
 
-        # Embed the query
-        print('Embedding query...')
+        Returns:
+            List of tuples: (result_dict, rerank_score)
+        """
+        if verbose:
+            print(f'Query: "{query}"\n')
+            print('='*80)
+            print('Embedding query...')
+
         query_vector = self.embed_query(query)
 
         # Determine how many candidates to retrieve
         num_to_retrieve = rerank_candidates if use_reranker else top_k
 
-        # Search Qdrant
-        print(f'Searching for top {num_to_retrieve} results...\n')
+        if verbose:
+            print(f'Searching for top {num_to_retrieve} results...\n')
+
         results = self.client.search(
             collection_name=self.collection_name,
             query_vector=query_vector,
@@ -93,8 +103,9 @@ class QueryEngine:
         )
 
         if not results:
-            print('No results found!')
-            return
+            if verbose:
+                print('No results found!')
+            return []
 
         # Convert results to the format expected by reranker
         results_list = []
@@ -109,46 +120,46 @@ class QueryEngine:
         if use_reranker:
             from reranker import DocumentReranker
 
-            reranker = DocumentReranker(verbose=True)
+            reranker = DocumentReranker(verbose=verbose)
 
             # STAGE 1: First rerank to get top 3
-            print('='*80)
-            print('STAGE 1: Initial Reranking')
-            print('='*80)
+            if verbose:
+                print('='*80)
+                print('STAGE 1: Initial Reranking')
+                print('='*80)
             first_rerank = reranker.rerank(query, results_list)
             top_3_initial = first_rerank[:3]
 
             # STAGE 2: Expand with sibling files and rerank again
-            print('='*80)
-            print('STAGE 2: Expanding with Related Files')
-            print('='*80)
-            expanded_results = self._expand_with_siblings(top_3_initial, results_list)
+            if verbose:
+                print('='*80)
+                print('STAGE 2: Expanding with Related Files')
+                print('='*80)
+            expanded_results = self._expand_with_siblings(top_3_initial, results_list, verbose=verbose)
 
-            print(f'\nExpanded from {len(top_3_initial)} to {len(expanded_results)} documents (including siblings)')
-            print('\n' + '='*80)
-            print('STAGE 2: Final Reranking')
-            print('='*80)
+            if verbose:
+                print(f'\nExpanded from {len(top_3_initial)} to {len(expanded_results)} documents (including siblings)')
+                print('\n' + '='*80)
+                print('STAGE 2: Final Reranking')
+                print('='*80)
             final_rerank = reranker.rerank(query, expanded_results)
 
             # Take top 3 after final reranking
-            results_to_display = final_rerank[:3]
+            results_to_display = final_rerank[:top_k]
 
-            print('\n' + '='*80)
-            print('FINAL TOP 3 RESULTS')
-            print('='*80)
-            self._print_results(results_to_display, reranked=True, original_results=results_list)
+            return results_to_display
         else:
-            # Display results without reranking
-            results_to_display = [(r, r['score']) for r in results_list[:top_k]]
-            self._print_results(results_to_display, reranked=False)
+            # Return results without reranking
+            return [(r, r['score']) for r in results_list[:top_k]]
 
-    def _expand_with_siblings(self, top_results, all_results):
+    def _expand_with_siblings(self, top_results, all_results, verbose: bool = True):
         """
         Expand top results with their sibling files from Qdrant.
 
         Args:
             top_results: List of (result, score) tuples from first rerank
             all_results: Original list of all retrieved results
+            verbose: Whether to print progress messages
 
         Returns:
             List of result dicts (without scores) ready for reranking
@@ -169,8 +180,9 @@ class QueryEngine:
             sibling_paths = payload.get('sibling_files', [])
 
             if sibling_paths:
-                print(f"\nFinding siblings for: {payload.get('file_path', 'N/A').split('/')[-1]}")
-                print(f"  Looking for {len(sibling_paths)} sibling file(s)...")
+                if verbose:
+                    print(f"\nFinding siblings for: {payload.get('file_path', 'N/A').split('/')[-1]}")
+                    print(f"  Looking for {len(sibling_paths)} sibling file(s)...")
 
                 found_count = 0
                 for sibling_path in sibling_paths:
@@ -179,23 +191,25 @@ class QueryEngine:
                         continue
 
                     # Try to find this sibling in our original results
-                    sibling_result = self._find_document_by_path(sibling_path)
+                    sibling_result = self._find_document_by_path(sibling_path, verbose=verbose)
 
                     if sibling_result:
                         expanded.append(sibling_result)
                         seen_paths.add(sibling_path)
                         found_count += 1
 
-                print(f"  Found {found_count} sibling(s) in Qdrant")
+                if verbose:
+                    print(f"  Found {found_count} sibling(s) in Qdrant")
 
         return expanded
 
-    def _find_document_by_path(self, file_path):
+    def _find_document_by_path(self, file_path, verbose: bool = True):
         """
         Find a document in Qdrant by its file path, or read from disk if not found.
 
         Args:
             file_path: The file path to search for
+            verbose: Whether to print messages
 
         Returns:
             Result dict if found, None otherwise
@@ -228,20 +242,22 @@ class QueryEngine:
             pass  # Fall through to reading from disk
 
         # If not in Qdrant, try to read from disk
-        return self._load_document_from_disk(file_path)
+        return self._load_document_from_disk(file_path, verbose=verbose)
 
-    def _load_document_from_disk(self, file_path):
+    def _load_document_from_disk(self, file_path, verbose: bool = True):
         """
         Load a document from disk and create a pseudo-document for reranking.
 
         Args:
             file_path: The file path to load
+            verbose: Whether to print messages
 
         Returns:
             Result dict with extracted content, or None if file cannot be read
         """
         if not os.path.exists(file_path):
-            print(f"  Warning: File not found on disk: {file_path.split('/')[-1]}")
+            if verbose:
+                print(f"  Warning: File not found on disk: {file_path.split('/')[-1]}")
             return None
 
         try:
@@ -249,7 +265,8 @@ class QueryEngine:
             text_content = self._extract_text_from_file(file_path)
 
             if not text_content or not text_content.strip():
-                print(f"  Warning: No content extracted from {file_path.split('/')[-1]}")
+                if verbose:
+                    print(f"  Warning: No content extracted from {file_path.split('/')[-1]}")
                 return None
 
             # Get file extension and type
@@ -272,11 +289,13 @@ class QueryEngine:
                 'id': f'disk_{hash(file_path)}'  # Generate a pseudo-ID
             }
 
-            print(f"  ✓ Loaded from disk: {file_path.split('/')[-1]} ({len(text_content)} chars)")
+            if verbose:
+                print(f"  ✓ Loaded from disk: {file_path.split('/')[-1]} ({len(text_content)} chars)")
             return pseudo_doc
 
         except Exception as e:
-            print(f"  Warning: Could not read {file_path.split('/')[-1]}: {e}")
+            if verbose:
+                print(f"  Warning: Could not read {file_path.split('/')[-1]}: {e}")
             return None
 
     def _extract_text_from_file(self, file_path):
@@ -414,39 +433,3 @@ class QueryEngine:
                     print(f'{idx}. {filename[:50]:50} (was #{original_pos}) {change_str}')
 
             print('='*80)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Query course materials using RAG')
-    parser.add_argument(
-        'query',
-        type=str,
-        help='The query to search for'
-    )
-    parser.add_argument(
-        '--collection',
-        type=str,
-        default='cs_materials',
-        help='Qdrant collection to search (default: cs_materials)'
-    )
-
-    args = parser.parse_args()
-
-    # Create query engine and search
-    engine = QueryEngine(
-        qdrant_host='localhost',
-        qdrant_port=6333,
-        collection_name=args.collection
-    )
-
-    # Hardcoded: retrieve top 10 results with reranking enabled
-    engine.search(
-        args.query,
-        top_k=10,
-        use_reranker=True,
-        rerank_candidates=10
-    )
-
-
-if __name__ == '__main__':
-    main()
