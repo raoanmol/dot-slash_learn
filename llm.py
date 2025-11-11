@@ -116,6 +116,15 @@ class LLMQuerySystem:
         if not documents:
             return "Sorry, I couldn't find any relevant documents to answer your question."
 
+        # Offload RAG models to CPU to free VRAM for LLM
+        print('\n' + '='*80)
+        print('FREEING VRAM: Moving RAG models to CPU...')
+        print('='*80)
+        self.query_engine.model.to('cpu')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print('VRAM freed\n')
+
         # Format context
         context = self.format_context(documents)
 

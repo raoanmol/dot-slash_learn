@@ -144,6 +144,11 @@ class QueryEngine:
                 print('='*80)
             final_rerank = reranker.rerank(query, expanded_results)
 
+            # Offload reranker to CPU to free VRAM
+            reranker.offload_to_cpu()
+            if verbose:
+                print()
+
             # Take top 3 after final reranking
             results_to_display = final_rerank[:top_k]
 

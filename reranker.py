@@ -159,3 +159,10 @@ class DocumentReranker:
             print()
 
         return reranked
+
+    def offload_to_cpu(self):
+        """Move the reranker model to CPU to free VRAM"""
+        if self.device.type == 'cuda':
+            self.rerank_model.to('cpu')
+            if self.verbose:
+                print('Reranker moved to CPU')
