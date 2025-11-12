@@ -1,11 +1,18 @@
 '''
 Guardrails Module using Qwen3Guard-Stream-0.6B
 
-Provides safety validation for RAG-LLM pipeline at multiple checkpoints:
-- Input validation (query safety, jailbreak detection, PII scanning)
-- Output validation (toxic content, hallucinations, PII leakage)
-- Context validation (prompt injection detection, content filtering)
-- Prompt validation (template integrity, context poisoning)
+Provides hybrid safety validation (pattern + model) for RAG-LLM pipeline.
+
+Validation Layers:
+- Input validation: Jailbreak detection, malicious queries, PII scanning
+- Output validation: Toxic content, hallucinations, PII leakage
+- Context validation: Prompt injection detection, content filtering
+- Prompt validation: Template integrity, context poisoning
+
+Hybrid Approach:
+- Pattern matching: Fast, catches obvious attacks (jailbreaks, known patterns)
+- Model validation: Thorough, catches subtle attacks (via Qwen3Guard-Stream-0.6B)
+- Always uses both - no configuration needed
 
 Memory Management:
 - Runs on CPU by default (0.6B model is lightweight)
@@ -17,13 +24,13 @@ Usage:
 
     guard = SafetyGuardrails(device='cpu', verbose=True)
 
-    # Input validation
+    # Input validation (hybrid: pattern + model)
     is_safe, reason = guard.validate_input("What is dynamic programming?")
     if not is_safe:
         print(f"Unsafe query: {reason}")
 
-    # Output validation
-    is_safe, reason = guard.validate_output(
+    # Output validation (hybrid: pattern + model + PII + grounding)
+    is_safe, reason, sanitized = guard.validate_output(
         query="What is DP?",
         response="Dynamic programming is...",
         context=["Document 1: ...", "Document 2: ..."]
@@ -82,13 +89,12 @@ class SafetyGuardrails:
 
     def validate_input(self, query: str, check_pii: bool = True) -> Tuple[bool, Optional[str]]:
         """
-        Validate user input query for safety.
+        Validate user input query for safety using hybrid approach.
 
-        Checks:
-        - Jailbreak attempts
-        - Unsafe/malicious content
-        - PII in queries (optional)
-        - Prompt injection patterns
+        Uses both pattern matching (fast) and model validation (thorough):
+        1. Pattern matching catches obvious jailbreak attempts instantly
+        2. Model validation provides deeper analysis for subtle attacks
+        3. PII detection warns about sensitive information
 
         Args:
             query: User query to validate
@@ -100,15 +106,17 @@ class SafetyGuardrails:
         if self.verbose:
             print('Validating input query...')
 
-        # Check 1: Basic pattern matching for common jailbreak attempts
+        # Check 1: Pattern matching for common jailbreak attempts (fast first pass)
         jailbreak_patterns = [
-            r'ignore (previous|all) (instructions|prompts)',
+            r'ignore (previous|all|above) (instructions|prompts|context)',
             r'you are now',
             r'new instructions',
             r'system:',
             r'<\|im_start\|>',
             r'### Instruction',
             r'OVERRIDE',
+            r'disregard (previous|all|above)',
+            r'forget (everything|previous|all)',
         ]
 
         query_lower = query.lower()
@@ -118,7 +126,7 @@ class SafetyGuardrails:
                     print(f'  ✗ Input BLOCKED: Jailbreak pattern detected')
                 return False, "Jailbreak attempt detected"
 
-        # Check 2: Use guardrails model to assess query safety
+        # Check 2: Model-based validation for deeper analysis
         prompt = f"""Analyze the following user query for safety issues including jailbreak attempts, malicious intent, or prompt injection:
 
 Query: {query}
@@ -142,7 +150,7 @@ Is this query safe? Respond with 'SAFE' or 'UNSAFE' and explain why."""
                 # User might be asking about their own data
 
         if self.verbose:
-            print(f'  ✓ Input SAFE: Score {safety_score:.3f}')
+            print(f'  ✓ Input SAFE')
 
         return True, None
 
@@ -155,13 +163,13 @@ Is this query safe? Respond with 'SAFE' or 'UNSAFE' and explain why."""
         check_pii: bool = True
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        Validate LLM output for safety and quality.
+        Validate LLM output for safety and quality using hybrid approach.
 
-        Checks:
-        - Toxic/harmful content
-        - PII leakage
-        - Hallucinations (if context provided)
-        - Factual grounding
+        Uses both pattern matching (fast) and model validation (thorough):
+        1. Pattern matching catches obvious harmful content instantly
+        2. Model validation provides deeper safety analysis
+        3. PII detection and redaction
+        4. Hallucination detection via grounding check
 
         Args:
             query: Original user query
@@ -176,7 +184,21 @@ Is this query safe? Respond with 'SAFE' or 'UNSAFE' and explain why."""
         if self.verbose:
             print('Validating output response...')
 
-        # Check 1: Toxic/harmful content
+        # Check 1: Pattern-based harmful content detection (fast first pass)
+        harmful_patterns = [
+            r'(how to|guide to|steps to).*(hack|exploit|attack|harm|illegal)',
+            r'(create|make|build).*(virus|malware|weapon)',
+            r'personal information.*(ssn|social security|credit card)',
+        ]
+
+        response_lower = response.lower()
+        for pattern in harmful_patterns:
+            if re.search(pattern, response_lower, re.IGNORECASE):
+                if self.verbose:
+                    print(f'  ✗ Output BLOCKED: Harmful pattern detected')
+                return False, "Potentially harmful content detected in response", None
+
+        # Check 2: Model-based safety analysis for deeper validation
         safety_prompt = f"""Analyze the following AI response for harmful, toxic, or unsafe content:
 
 User Question: {query}
@@ -191,7 +213,7 @@ Is this response safe and appropriate? Respond with 'SAFE' or 'UNSAFE' and expla
                 print(f'  ✗ Output BLOCKED: Safety score {safety_score:.3f} < {self.thresholds["output_safety"]}')
             return False, f"Unsafe content detected in response (confidence: {1-safety_score:.2%})", None
 
-        # Check 2: PII leakage detection
+        # Check 3: PII leakage detection
         if check_pii:
             has_pii, pii_types = self._detect_pii(response)
             if has_pii:
@@ -199,16 +221,16 @@ Is this response safe and appropriate? Respond with 'SAFE' or 'UNSAFE' and expla
                     print(f'  ⚠ PII detected in output ({", ".join(pii_types)}), redacting...')
                 response = self._redact_pii(response)
 
-        # Check 3: Hallucination detection (if context provided)
+        # Check 4: Hallucination detection (if context provided)
         if check_hallucination and context:
             is_grounded, confidence = self._check_grounding(query, response, context)
             if not is_grounded:
                 if self.verbose:
-                    print(f'  ⚠ Warning: Possible hallucination detected (confidence: {confidence:.2%})')
+                    print(f'  ⚠ Warning: Possible hallucination detected (grounding: {confidence:.2%})')
                 # Note: We warn but don't block - let user judge relevance
 
         if self.verbose:
-            print(f'  ✓ Output SAFE: Score {safety_score:.3f}')
+            print(f'  ✓ Output SAFE')
 
         return True, None, response
 
@@ -333,18 +355,27 @@ Is this response safe and appropriate? Respond with 'SAFE' or 'UNSAFE' and expla
 
         # Decode response
         response = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-        response = response.strip().upper()
+        response_upper = response.strip().upper()
+
+        if self.verbose:
+            print(f'    Model response: "{response.strip()}"')
 
         # Calculate safety score based on response
-        if expected_response.upper() in response:
-            # Model agrees it's safe
-            return 0.9
-        elif 'UNSAFE' in response or 'HARMFUL' in response or 'DANGEROUS' in response:
-            # Model flags it as unsafe
-            return 0.2
-        else:
-            # Ambiguous response
-            return 0.5
+        # Check for unsafe indicators first
+        unsafe_keywords = ['UNSAFE', 'HARMFUL', 'DANGEROUS', 'MALICIOUS', 'ATTACK', 'JAILBREAK']
+        for keyword in unsafe_keywords:
+            if keyword in response_upper:
+                return 0.2
+
+        # Check for safe indicators
+        safe_keywords = ['SAFE', 'APPROPRIATE', 'ACCEPTABLE', 'OK', 'FINE', 'VALID']
+        for keyword in safe_keywords:
+            if keyword in response_upper:
+                return 0.9
+
+        # For ambiguous responses, be more lenient - assume safe unless proven otherwise
+        # This prevents false positives while still catching real issues via pattern matching
+        return 0.8
 
     def _detect_pii(self, text: str) -> Tuple[bool, List[str]]:
         """

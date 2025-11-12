@@ -107,7 +107,7 @@ def test_output_validation():
     if sanitized:
         print(f"Sanitized response: {sanitized}")
 
-    # Test 2c: Grounding check
+    # Test 2c: Grounding check with context
     print('\n[Test 2c] Grounding check with context')
     print('-'*80)
     query = "What is binary search?"
