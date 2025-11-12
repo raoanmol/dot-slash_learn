@@ -106,8 +106,9 @@ def embed_subject(subject_key, config, qdrant_host = 'localhost', qdrant_port = 
             qdrant_host = qdrant_host,
             qdrant_port = qdrant_port,
             collection_name = config['collection'],
-            # exclude_extensions = exclude_extensions or ['.py', '.txt', '.js', '.java', '.cpp', '.c']
             exclude_extensions = exclude_extensions or []
+            # Old behavior: Exclude code and text files
+            # exclude_extensions = exclude_extensions or ['.py', '.txt', '.js', '.java', '.cpp', '.c']
         )
 
         total_embedded = 0
@@ -146,8 +147,9 @@ def main():
     parser.add_argument(
         '--exclude-extensions',
         nargs = '+',
-        default = ['.py', '.txt', '.js', '.java', '.cpp', '.c'],
-        help = 'File extensions to exclude'
+        default = [],  # Embed everything by default
+        # Old default: ['.py', '.txt', '.js', '.java', '.cpp', '.c']
+        help = 'File extensions to exclude (default: none, embed everything)'
     )
 
     args = parser.parse_args()
