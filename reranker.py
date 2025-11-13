@@ -107,7 +107,7 @@ class DocumentReranker:
 
         return relevance_score
 
-    def rerank(self, query: str, results: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], float]]:
+    def rerank(self, query: str, results: List[Dict[str, Any]], min_score: float = None) -> List[Tuple[Dict[str, Any], float]]:
         """
         Rerank search results using the reranker model.
 
@@ -116,6 +116,7 @@ class DocumentReranker:
             results: List of search results. Each result should be a dict with either:
                      - 'payload' key containing document metadata, OR
                      - document metadata directly in the dict
+            min_score: Minimum reranker score threshold. Documents below this score are filtered out.
 
         Returns:
             List of tuples: (result, rerank_score), sorted by rerank_score descending
@@ -154,6 +155,13 @@ class DocumentReranker:
 
         # Sort by rerank score (descending)
         reranked.sort(key=lambda x: x[1], reverse=True)
+
+        # Filter by minimum score if specified
+        if min_score is not None:
+            original_count = len(reranked)
+            reranked = [(result, score) for result, score in reranked if score >= min_score]
+            if self.verbose and original_count > len(reranked):
+                print(f'  Filtered out {original_count - len(reranked)} documents below threshold {min_score:.1f}')
 
         if self.verbose:
             print()
