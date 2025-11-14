@@ -76,7 +76,7 @@ class QueryEngine:
 
         return embedding.cpu().numpy().tolist()
 
-    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 50, stage1_top_k: int = 7, verbose: bool = True):
+    def search(self, query: str, top_k: int = 3, use_reranker: bool = False, rerank_candidates: int = 50, stage1_top_k: int = 7, min_score: float = 7.0, verbose: bool = True):
         """
         Search for relevant documents with two-stage reranking.
 
@@ -85,11 +85,13 @@ class QueryEngine:
         2. STAGE 1: Rerank to get top 7
         3. Expand top 7 with neighboring chunks
         4. STAGE 2: Rerank expanded set to get final top_k (default: 3)
+        5. Filter out documents with reranker score < min_score
 
         Args:
             top_k: Final number of documents to return (default: 3)
             rerank_candidates: Number of initial candidates to retrieve (default: 50)
             stage1_top_k: Number of documents to keep after stage 1 rerank (default: 7)
+            min_score: Minimum reranker score threshold (default: 7.0). Documents below this are filtered out.
 
         Returns:
             List of tuples: (result_dict, rerank_score)
@@ -153,15 +155,21 @@ class QueryEngine:
                 print('\n' + '='*80)
                 print('STAGE 2: Final Reranking')
                 print('='*80)
-            final_rerank = reranker.rerank(query, expanded_results)
+            final_rerank = reranker.rerank(query, expanded_results, min_score=min_score)
 
             # Offload reranker to CPU to free VRAM
             reranker.offload_to_cpu()
             if verbose:
                 print()
 
-            # Take top 3 after final reranking
+            # Take top_k after filtering by min_score
+            # Note: reranker already filters by min_score, so we just need to limit to top_k
             results_to_display = final_rerank[:top_k]
+
+            if verbose and len(final_rerank) == 0:
+                print(f'⚠ No documents passed the minimum score threshold of {min_score:.1f}')
+            elif verbose and len(final_rerank) < top_k:
+                print(f'⚠ Only {len(final_rerank)} documents passed the minimum score threshold of {min_score:.1f}')
 
             return results_to_display
         else:

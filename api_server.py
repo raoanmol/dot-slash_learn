@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from llm import LLMQuerySystem
+from course_embedder import CourseEmbedder
 
 # Configure logging
 logging.basicConfig(
@@ -42,8 +43,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global cache for LLM systems
+# Global cache for LLM systems and embedders
 llm_systems: Dict[str, LLMQuerySystem] = {}
+embedders: Dict[str, CourseEmbedder] = {}
 
 
 # ============================================================================
@@ -81,6 +83,69 @@ class QueryResponse(BaseModel):
     error: Optional[str] = None
 
 
+class EmbedRequest(BaseModel):
+    """Request model for embed endpoint"""
+    file_paths: List[str] = Field(
+        ...,
+        description="List of absolute file paths to embed",
+        min_length=1
+    )
+    learning_objective: str = Field(
+        ...,
+        description="Description of what these files teach",
+        min_length=1
+    )
+    collection_name: str = Field(
+        default="cs_materials",
+        description="Qdrant collection to store embeddings"
+    )
+    course: Optional[str] = Field(
+        default=None,
+        description="Optional course identifier (e.g., '6_0001')"
+    )
+    group_type: Optional[str] = Field(
+        default=None,
+        description="Optional group type (e.g., 'lecture', 'assignment')"
+    )
+    group_id: Optional[str] = Field(
+        default=None,
+        description="Optional group identifier"
+    )
+
+
+class EmbedResponse(BaseModel):
+    """Response model for embed endpoint"""
+    success: bool
+    total_chunks: int
+    files_processed: int
+    skills: List[str] = []
+    errors: List[str] = []
+    message: Optional[str] = None
+
+
+class DeleteFileRequest(BaseModel):
+    """Request model for delete file endpoint"""
+    file_paths: List[str] = Field(
+        ...,
+        description="List of exact file paths to delete",
+        min_length=1
+    )
+    collection_name: str = Field(
+        default="cs_materials",
+        description="Qdrant collection to delete from"
+    )
+
+
+class DeleteFileResponse(BaseModel):
+    """Response model for delete file endpoint"""
+    success: bool
+    chunks_deleted: int
+    files_deleted: int
+    message: str
+    errors: List[str] = []
+    error: Optional[str] = None
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -107,6 +172,22 @@ def get_llm_system(
     return llm_systems[cache_key]
 
 
+def get_embedder(collection_name: str) -> CourseEmbedder:
+    """Get or create a CourseEmbedder (with caching)"""
+    if collection_name not in embedders:
+        logger.info(f"Initializing CourseEmbedder for collection: {collection_name}")
+        qdrant_host = os.getenv("QDRANT_HOST", "localhost")
+        qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
+
+        embedders[collection_name] = CourseEmbedder(
+            qdrant_host=qdrant_host,
+            qdrant_port=qdrant_port,
+            collection_name=collection_name
+        )
+
+    return embedders[collection_name]
+
+
 def format_documents(documents) -> List[Dict[str, Any]]:
     """Format retrieved documents for API response"""
     formatted_docs = []
@@ -116,6 +197,7 @@ def format_documents(documents) -> List[Dict[str, Any]]:
             'file_path': payload.get('file_path', 'N/A'),
             'course': payload.get('course', 'N/A'),
             'file_type': payload.get('file_type', 'N/A'),
+            'skills': payload.get('skills', []),
             'relevance_score': score,
             'content_preview': payload.get('content_preview', ''),
             'chunk_index': payload.get('chunk_index'),
@@ -135,7 +217,11 @@ async def root():
         "name": "RAG-LLM Query API",
         "version": "1.0.0",
         "docs": "/docs",
-        "query_endpoint": "/api/v1/query"
+        "endpoints": {
+            "query": "/api/v1/query",
+            "embed": "/api/v1/embed",
+            "delete": "/api/v1/embed (DELETE)"
+        }
     }
 
 
@@ -217,6 +303,117 @@ async def query_llm(request: QueryRequest):
         return QueryResponse(
             answer="",
             success=False,
+            error=str(e)
+        )
+
+
+@app.post("/api/v1/embed", response_model=EmbedResponse)
+async def embed_files(request: EmbedRequest):
+    """
+    Embed files into a Qdrant collection with skill-based classification.
+
+    Pipeline:
+    1. Extract text from all files
+    2. Use LLM to extract 5-6 high-level skills from combined content
+    3. Chunk documents
+    4. Parallel processing:
+       - Classify each chunk into skills (multithreaded)
+       - Generate embeddings for each chunk
+    5. Store in Qdrant with skill metadata
+    """
+    try:
+        logger.info(f"Embedding {len(request.file_paths)} files into collection: {request.collection_name}")
+        logger.info(f"Learning objective: {request.learning_objective[:100]}...")
+
+        # Get embedder (creates collection if needed)
+        embedder = get_embedder(request.collection_name)
+
+        # Embed files
+        result = embedder.embed_files(
+            file_paths=request.file_paths,
+            learning_objective=request.learning_objective,
+            course=request.course,
+            group_type=request.group_type,
+            group_id=request.group_id
+        )
+
+        response = EmbedResponse(
+            success=result['success'],
+            total_chunks=result['total_chunks'],
+            files_processed=result['files_processed'],
+            skills=result.get('skills', []),
+            errors=result['errors'],
+            message=f"Successfully embedded {result['files_processed']} files into {result['total_chunks']} chunks with {len(result.get('skills', []))} skills"
+        )
+
+        logger.info(f"Embedding complete: {result['total_chunks']} chunks created with skills: {result.get('skills', [])}")
+        return response
+
+    except Exception as e:
+        logger.error(f"Embedding failed: {e}", exc_info=True)
+        return EmbedResponse(
+            success=False,
+            total_chunks=0,
+            files_processed=0,
+            skills=[],
+            errors=[str(e)],
+            message="Embedding failed"
+        )
+
+
+@app.delete("/api/v1/embed", response_model=DeleteFileResponse)
+async def delete_files(request: DeleteFileRequest):
+    """
+    Delete all chunks associated with specific files from a collection.
+
+    This removes all embedded chunks that were created from the specified files.
+    Accepts a list of file paths and deletes them all.
+    """
+    try:
+        logger.info(f"Deleting {len(request.file_paths)} files from collection: {request.collection_name}")
+
+        # Get embedder
+        embedder = get_embedder(request.collection_name)
+
+        # Delete files
+        total_chunks_deleted = 0
+        files_deleted = 0
+        errors = []
+
+        for file_path in request.file_paths:
+            logger.info(f"  Deleting: {file_path}")
+            result = embedder.delete_file(file_path)
+
+            if result['success']:
+                total_chunks_deleted += result['chunks_deleted']
+                if result['chunks_deleted'] > 0:
+                    files_deleted += 1
+                else:
+                    errors.append(f"No chunks found for: {file_path}")
+            else:
+                errors.append(f"Failed to delete {file_path}: {result.get('error', 'Unknown error')}")
+
+        success = files_deleted > 0 or (len(errors) == 0 and len(request.file_paths) > 0)
+
+        response = DeleteFileResponse(
+            success=success,
+            chunks_deleted=total_chunks_deleted,
+            files_deleted=files_deleted,
+            message=f"Successfully deleted {files_deleted} files ({total_chunks_deleted} chunks)",
+            errors=errors
+        )
+
+        logger.info(f"Deletion complete: {files_deleted} files, {total_chunks_deleted} chunks removed")
+        return response
+
+    except Exception as e:
+        logger.error(f"Deletion failed: {e}", exc_info=True)
+        return DeleteFileResponse(
+            success=False,
+            chunks_deleted=0,
+            files_deleted=0,
+            message="Deletion failed",
+            errors=[],
             error=str(e)
         )
 

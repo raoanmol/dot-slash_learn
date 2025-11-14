@@ -72,6 +72,92 @@ class LLMQuerySystem:
             self.llm.eval()
             print(f'LLM loaded successfully\n')
 
+    def _rewrite_query(self, original_query: str) -> str:
+        """
+        Rewrite the user query to be more detailed and contextually rich for RAG.
+
+        This helps improve similarity search by expanding simple questions into
+        more comprehensive queries that match better with course material embeddings.
+
+        Args:
+            original_query: The user's original question
+
+        Returns:
+            Rewritten query optimized for RAG retrieval
+        """
+        # Load LLM if not already loaded (should be on GPU)
+        self._load_llm()
+
+        # Build prompt for query rewriting with better instructions
+        rewrite_prompt = f"""You are improving search accuracy for a Retrieval-Augmented Generation (RAG) system that searches computer science course materials.
+
+The RAG system uses vector similarity search - it embeds queries and documents, then finds the most similar documents. Simple queries often don't match well with technical course content.
+
+Your task: Rewrite the user's question to include MORE technical terminology, synonyms, related concepts, and CS-specific vocabulary. This will improve the embedding similarity with course materials.
+
+Original question: "{original_query}"
+
+Guidelines:
+- Add technical terms and synonyms (e.g., "OOP" → "object-oriented programming, OOP, encapsulation, inheritance, polymorphism")
+- Include related concepts that appear in course materials
+- Expand abbreviations and add full terms
+- Keep the same meaning but make it more detailed and technical
+- Make it sound like how a CS textbook or lecture would phrase it
+
+Examples:
+Input: "What is DP?"
+Output: "dynamic programming algorithms, DP optimization technique, memoization and tabulation, optimal substructure property, overlapping subproblems, recursive solutions with caching"
+
+Input: "How do loops work?"
+Output: "iteration and loops in programming, for loops and while loops, loop control flow, iterative structures, loop counters and conditions, nested loops and loop execution"
+
+Now rewrite this query for better RAG search results:"""
+
+        # Format as conversation
+        messages = [
+            {
+                "role": "user",
+                "content": rewrite_prompt
+            }
+        ]
+
+        # Apply chat template and tokenize
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=text, return_tensors='pt')
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # Generate rewritten query
+        with torch.no_grad():
+            outputs = self.llm.generate(
+                **inputs,
+                max_new_tokens=100,  # Keep it concise
+                temperature=0.5,      # Moderate temperature
+                top_p=0.9,
+                do_sample=True
+            )
+
+        # Decode response (skip the input prompt tokens)
+        rewritten = self.processor.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+
+        # Clean up the response
+        rewritten = rewritten.strip()
+
+        # Remove any common prefixes the model might add
+        prefixes_to_remove = ['Output:', 'Expanded query:', 'Answer:', 'A:', 'Q:']
+        for prefix in prefixes_to_remove:
+            if rewritten.startswith(prefix):
+                rewritten = rewritten[len(prefix):].strip()
+
+        # Take only the first paragraph/line if multiple were generated
+        if '\n' in rewritten:
+            rewritten = rewritten.split('\n')[0].strip()
+
+        # If rewriting failed or produced garbage, use original query
+        if len(rewritten) < 3 or len(rewritten) > 500:
+            return original_query
+
+        return rewritten
+
     def format_context(self, documents: List[Tuple[Dict[str, Any], float]]) -> str:
         """
         Format retrieved documents as context for the LLM.
@@ -110,6 +196,11 @@ class LLMQuerySystem:
         """
         Query the LLM with RAG context.
 
+        VRAM Management Strategy:
+        1. Guardrails (CPU) + LLM (GPU) for input validation and query rewriting
+        2. Offload guardrails + LLM, load embedder + reranker for RAG
+        3. Offload RAG models, reload guardrails + LLM for answer generation
+
         Args:
             user_query: The user's question
             show_context: Whether to print the retrieved documents (for debugging)
@@ -118,6 +209,17 @@ class LLMQuerySystem:
         Returns:
             LLM response string
         """
+        # PHASE 1: INPUT VALIDATION & QUERY REWRITING (Guardrails + LLM on GPU)
+        # ============================================================================
+
+        # Move guardrails to GPU for faster validation
+        if self.enable_guardrails:
+            print('\n' + '='*80)
+            print('LOADING GUARDRAILS to GPU...')
+            print('='*80)
+            self.guardrails.move_to_gpu()
+            print('Guardrails ready on GPU\n')
+
         # GUARDRAIL CHECKPOINT 1: Validate input query
         if self.enable_guardrails:
             print('\n' + '='*80)
@@ -133,22 +235,54 @@ class LLMQuerySystem:
 
             print('='*80)
 
-        # Stage 1 & 2: Perform RAG with two-stage reranking
+        # QUERY REWRITING: Expand query for better RAG retrieval
+        print('\n' + '='*80)
+        print('QUERY REWRITING: Expanding query for RAG')
+        print('='*80)
+        print(f'Original query: "{user_query}"')
+
+        rewritten_query = self._rewrite_query(user_query)
+        print(f'Rewritten query: "{rewritten_query}"')
+        print('='*80)
+
+        # PHASE 2: RAG RETRIEVAL (Embedder + Reranker on GPU)
+        # ============================================================================
+
+        # Offload guardrails and LLM to CPU to free VRAM for RAG models
+        print('\n' + '='*80)
+        print('FREEING VRAM: Moving Guardrails + LLM to CPU for RAG...')
+        print('='*80)
+
+        if self.enable_guardrails:
+            self.guardrails.offload_to_cpu()
+
+        if self.llm is not None:
+            self.llm.to('cpu')
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print('VRAM freed\n')
+
+        # Stage 1 & 2: Perform RAG with two-stage reranking using rewritten query
         print('\n' + '='*80)
         print('RETRIEVING RELEVANT DOCUMENTS')
         print('='*80)
 
         documents = self.query_engine.search(
-            query=user_query,
+            query=rewritten_query,  # Use rewritten query for embedding
             top_k=3,               # Final number of documents to pass to LLM
             use_reranker=True,
             rerank_candidates=50,  # Retrieve 50 candidates from vector search
             stage1_top_k=7,        # Keep top 7 after first rerank, then expand with neighbors
+            min_score=7.0,         # Minimum reranker score threshold
             verbose=True
         )
 
-        if not documents:
-            return "Sorry, I couldn't find any relevant documents to answer your question."
+        # Allow LLM to answer without RAG if no documents pass the threshold
+        use_rag = len(documents) > 0
+
+        # PHASE 3: ANSWER GENERATION (LLM + Guardrails on GPU)
+        # ============================================================================
 
         # Offload RAG models to CPU to free VRAM for LLM
         print('\n' + '='*80)
@@ -159,23 +293,49 @@ class LLMQuerySystem:
             torch.cuda.empty_cache()
         print('VRAM freed\n')
 
-        # Format context
-        context = self.format_context(documents)
+        # Format context if we have documents
+        if use_rag:
+            context = self.format_context(documents)
 
-        # Show retrieved documents for debugging
-        if show_context:
+            # Show retrieved documents for debugging
+            if show_context:
+                print('\n' + '='*80)
+                print('RETRIEVED DOCUMENTS (Context for LLM)')
+                print('='*80)
+                print(context)
+        else:
             print('\n' + '='*80)
-            print('RETRIEVED DOCUMENTS (Context for LLM)')
+            print('⚠ NO DOCUMENTS PASSED THRESHOLD - LLM will answer without RAG')
             print('='*80)
-            print(context)
 
-        # Now load LLM after RAG models are offloaded
-        self._load_llm()
+        # Reload LLM and Guardrails to GPU for answer generation
+        print('\n' + '='*80)
+        print('RELOADING LLM + GUARDRAILS to GPU for answer generation...')
+        print('='*80)
 
-        # Build prompt
-        prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer.
+        # Move LLM back to GPU
+        if self.llm is not None:
+            self.llm.to(self.device)
+        else:
+            self._load_llm()
+
+        # Move guardrails back to GPU
+        if self.enable_guardrails:
+            self.guardrails.move_to_gpu()
+
+        print('LLM + Guardrails ready on GPU\n')
+
+        # Build prompt using ORIGINAL user query (not rewritten)
+        if use_rag:
+            prompt = f"""Based on the following course materials, please answer the question. Use the information from the documents to provide a comprehensive and accurate answer.
 
 {context}
+
+Question: {user_query}
+
+Answer:"""
+        else:
+            prompt = f"""Please answer the following question to the best of your knowledge. Note that no relevant course materials were found with high enough confidence, so provide a general answer based on your training.
 
 Question: {user_query}
 
@@ -222,18 +382,19 @@ Answer:"""
             print('GUARDRAIL CHECK: Validating Output Response')
             print('='*80)
 
-            # Extract content from documents for grounding check
+            # Extract content from documents for grounding check (if we have any)
             context_texts = []
-            for result, score in documents:
-                payload = result['payload']
-                content = payload.get('full_content', payload.get('content_preview', ''))
-                context_texts.append(content)
+            if use_rag:
+                for result, score in documents:
+                    payload = result['payload']
+                    content = payload.get('full_content', payload.get('content_preview', ''))
+                    context_texts.append(content)
 
             is_safe, reason, sanitized_response = self.guardrails.validate_output(
                 query=user_query,
                 response=response,
-                context=context_texts,
-                check_hallucination=True,
+                context=context_texts if use_rag else None,
+                check_hallucination=use_rag,  # Only check hallucination if we have context
                 check_pii=True
             )
 

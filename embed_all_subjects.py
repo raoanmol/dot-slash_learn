@@ -24,8 +24,8 @@ SUBJECT_CONFIG = {
     'cs': {
         'collection': 'cs_materials',
         'groups_paths': [
-            'data/computer_science/6_0001/coursework_mappings.json',
-            'data/computer_science/6_006/coursework_mappings.json'
+            'data/computer_science/6_0001/coursework_mappings.json'
+            # 'data/computer_science/6_006/coursework_mappings.json'
         ],
         'display_name': 'Computer Science'
     },
@@ -106,9 +106,9 @@ def embed_subject(subject_key, config, qdrant_host = 'localhost', qdrant_port = 
             qdrant_host = qdrant_host,
             qdrant_port = qdrant_port,
             collection_name = config['collection'],
-            exclude_extensions = exclude_extensions or []
+            # exclude_extensions = exclude_extensions or []
             # Old behavior: Exclude code and text files
-            # exclude_extensions = exclude_extensions or ['.py', '.txt', '.js', '.java', '.cpp', '.c']
+            exclude_extensions = exclude_extensions or ['.py', '.txt', '.js', '.java', '.cpp', '.c']
         )
 
         total_embedded = 0
