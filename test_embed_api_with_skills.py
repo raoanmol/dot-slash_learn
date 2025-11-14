@@ -22,10 +22,10 @@ def test_embed_with_skills():
     # Sample request - you should replace these with actual file paths
     request_data = {
         "file_paths": [
-            "/Users/anmolrao/Code/dot-slash_learn/data/computer_science/6_0001/lectures/2dd6c75e7b4bd6bd135078e6f3701201_MIT6_0001F16_Lec9.pdf",  # Replace with actual path
-            "6ba59859535f1566dd57a7279aeba5d1_MIT6_0001F16_Lec4.pdf"
+            "/home/exouser/pylti1.3-fastapi/downloaded_materials/course-5/Lecture-1/1762932458_867__904de062253d2fad3064ab5ca917883d_nykOeWgQcHM.pdf",  # Replace with actual path
+            "/home/exouser/pylti1.3-fastapi/downloaded_materials/course-5/Lecture-1/1762933012_588__e921a690079369751bcce3e34da6c6ee_MIT6_0001F16_Lec1.pdf"
         ],
-        "learning_objective": "Object-Oriented Programming",
+        "learning_objective": "Introduction to Programming in Python",
         "collection_name": "test_skills_collection",
         "course": "CS101",
         "group_type": "lecture",
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     print("=" * 80)
 
     # Uncomment to test embedding (after updating file paths)
-    # test_embed_with_skills()
+    test_embed_with_skills()
 
     # Uncomment to test querying (after embedding some documents)
     # test_query_with_skills()

@@ -27,11 +27,18 @@ import torch
 import PyPDF2
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from qdrant_client import QdrantClient
 from transformers import AutoTokenizer, AutoModel, AutoProcessor, AutoModelForImageTextToText
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 
 class CourseEmbedder:
@@ -77,6 +84,7 @@ class CourseEmbedder:
         # LLM components for skill extraction/classification (lazy loaded)
         self.llm = None
         self.llm_processor = None
+        self.llm_device = torch.device('cpu')
 
     def _load_llm(self):
         """Lazy load the LLM model for skill extraction and classification"""
@@ -89,7 +97,17 @@ class CourseEmbedder:
                 device_map='auto'
             )
             self.llm.eval()
-            print('LLM loaded successfully\n')
+            try:
+                self.llm_device = next(self.llm.parameters()).device
+            except StopIteration:
+                self.llm_device = torch.device('cpu')
+            print(f'LLM loaded successfully on device: {self.llm_device}\n')
+        else:
+            # Ensure cached model reflects its current device when reused
+            try:
+                self.llm_device = next(self.llm.parameters()).device
+            except StopIteration:
+                self.llm_device = torch.device('cpu')
 
     def _extract_skills(self, combined_text: str, learning_objective: str, max_skills: int = 6) -> List[str]:
         """
@@ -131,7 +149,7 @@ Skills:"""
 
         text = self.llm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.llm_processor(text=text, return_tensors='pt')
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        inputs = {k: v.to(self.llm_device) for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = self.llm.generate(
@@ -202,7 +220,7 @@ Classification:"""
 
         text = self.llm_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.llm_processor(text=text, return_tensors='pt')
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        inputs = {k: v.to(self.llm_device) for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = self.llm.generate(
@@ -447,6 +465,9 @@ Classification:"""
         course: str = None,
         group_type: str = None,
         group_id: str = None,
+        module_name: Optional[str] = None,
+        module_item_ids: Optional[List[str]] = None,
+        file_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
         **extra_metadata
     ) -> Dict[str, Any]:
         """
@@ -645,6 +666,16 @@ Classification:"""
                 payload['group_type'] = group_type
             if group_id:
                 payload['group_id'] = group_id
+            if module_name:
+                payload['module_name'] = module_name
+            if module_item_ids:
+                payload['module_item_ids'] = module_item_ids
+
+            metadata_for_file = None
+            if file_metadata:
+                metadata_for_file = file_metadata.get(file_path) or file_metadata.get(str(file_path))
+            if metadata_for_file:
+                payload.update(metadata_for_file)
 
             # Add any extra metadata
             payload.update(extra_metadata)
@@ -682,6 +713,143 @@ Classification:"""
             'skills': skills
         }
 
+    def collect_module_status(
+        self,
+        course: Optional[str] = None,
+        group_type: Optional[str] = "module",
+    ) -> List[Dict[str, Any]]:
+        """Return aggregated status for embedded modules."""
+        module_map: Dict[str, Dict[str, Any]] = {}
+        items_key = "items"
+        offset = None
+
+        filter_conditions = []
+        if course:
+            filter_conditions.append(
+                FieldCondition(key="course", match=MatchValue(value=course))
+            )
+        if group_type:
+            filter_conditions.append(
+                FieldCondition(key="group_type", match=MatchValue(value=group_type))
+            )
+
+        if filter_conditions:
+            scroll_filter = Filter(must=filter_conditions)
+        else:
+            scroll_filter = None
+
+        while True:
+            scroll_kwargs: Dict[str, Any] = {
+                "collection_name": self.collection_name,
+                "limit": 200,
+                "with_payload": True,
+                "with_vectors": False,
+            }
+            if scroll_filter is not None:
+                scroll_kwargs["scroll_filter"] = scroll_filter
+            if offset is not None:
+                scroll_kwargs["offset"] = offset
+
+            records, offset = self.client.scroll(**scroll_kwargs)
+            if not records and offset is None:
+                break
+
+            for record in records or []:
+                payload = record.payload or {}
+                group_id = payload.get("group_id")
+                if not group_id:
+                    continue
+
+                group_id_str = str(group_id)
+                module_entry = module_map.setdefault(
+                    group_id_str,
+                    {
+                        "group_id": group_id_str,
+                        "module_name": payload.get("module_name"),
+                        "learning_objective": payload.get("learning_objective"),
+                        "file_paths": set(),
+                        "absolute_file_paths": set(),
+                        "skills": set(),
+                        "module_item_ids": set(),
+                        items_key: {},
+                        "chunk_count": 0,
+                        "ingested_at": payload.get("ingested_at"),
+                    },
+                )
+
+                module_entry["chunk_count"] += 1
+
+                requested_path = payload.get("requested_path") or payload.get("file_path")
+                absolute_path = payload.get("file_path")
+                if requested_path:
+                    module_entry["file_paths"].add(str(requested_path))
+                if absolute_path:
+                    module_entry["absolute_file_paths"].add(str(absolute_path))
+
+                for skill in payload.get("skills") or []:
+                    module_entry["skills"].add(skill)
+
+                module_item_id = payload.get("module_item_id")
+                if module_item_id is not None:
+                    item_id_str = str(module_item_id)
+                    module_entry["module_item_ids"].add(item_id_str)
+                    items_map: Dict[str, Dict[str, Any]] = module_entry[items_key]
+                    item_entry = items_map.setdefault(
+                        item_id_str,
+                        {
+                            "module_item_id": item_id_str,
+                            "file_paths": set(),
+                            "absolute_file_paths": set(),
+                            "skills": set(),
+                            "chunk_count": 0,
+                        },
+                    )
+                    item_entry["chunk_count"] += 1
+                    if requested_path:
+                        item_entry["file_paths"].add(str(requested_path))
+                    if absolute_path:
+                        item_entry["absolute_file_paths"].add(str(absolute_path))
+                    for skill in payload.get("skills") or []:
+                        item_entry["skills"].add(skill)
+
+                ingested_at = payload.get("ingested_at")
+                if ingested_at:
+                    current = module_entry.get("ingested_at")
+                    if current is None or str(ingested_at) > str(current):
+                        module_entry["ingested_at"] = ingested_at
+
+            if offset is None:
+                break
+
+        results: List[Dict[str, Any]] = []
+        for module_entry in module_map.values():
+            items_map = module_entry.pop(items_key)
+            module_entry["file_paths"] = sorted(module_entry["file_paths"])
+            module_entry["absolute_file_paths"] = sorted(module_entry["absolute_file_paths"])
+            module_entry["skills"] = sorted(module_entry["skills"])
+            module_entry["module_item_ids"] = sorted(module_entry["module_item_ids"])
+            module_entry["file_count"] = len(module_entry["file_paths"])
+
+            items_list: List[Dict[str, Any]] = []
+            for item_entry in items_map.values():
+                items_list.append(
+                    {
+                        "module_item_id": item_entry["module_item_id"],
+                        "file_paths": sorted(item_entry["file_paths"]),
+                        "absolute_file_paths": sorted(item_entry["absolute_file_paths"]),
+                        "skills": sorted(item_entry["skills"]),
+                        "file_count": len(item_entry["file_paths"]),
+                        "chunk_count": item_entry["chunk_count"],
+                    }
+                )
+
+            items_list.sort(key=lambda entry: entry["module_item_id"] or "")
+            module_entry["items"] = items_list
+            results.append(module_entry)
+
+        results.sort(key=lambda entry: entry.get("module_name") or entry["group_id"])
+        return results
+
     def delete_file(self, file_path: str) -> Dict[str, Any]:
         """
         Delete all chunks associated with a specific file from the collection.
@@ -692,8 +860,6 @@ Classification:"""
         Returns:
             Dict with success status and number of chunks deleted
         """
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-
         try:
             # Search for all points with matching file_path
             search_result = self.client.scroll(
